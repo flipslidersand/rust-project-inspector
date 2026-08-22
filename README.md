@@ -45,9 +45,13 @@ rpi inspect . --fail-on warn       # warn 以上があれば exit 1（CI ゲー�
 workspace ルートに置くと閾値を上書きできる（未指定キーは既定値）。
 
 ```toml
-module_size_loc = 300       # ファイル LOC 警告閾値
-pub_surface_warn = 50       # crate あたり pub item 警告閾値
-unsafe_density_warn = 5.0   # unsafe 件数 / kLOC の警告閾値
+module_size_loc         = 300   # ファイル LOC 警告閾値
+pub_surface_warn        = 50    # crate あたり pub item 警告閾値
+unsafe_density_warn     = 5.0   # unsafe 件数 / kLOC の警告閾値
+coupling_warn           = 20    # ファイルあたりの依存 crate 数警告閾値
+complexity_warn         = 10    # 関数の循環的複雑度警告閾値
+churn_warn              = 5     # git 変更回数の警告閾値（complexity_warn も超えた場合に発火）
+churn_git_timeout_secs  = 30    # git log の最大実行秒数（超過時は churn-hotspot をスキップ）
 ```
 
 ## CI 連携
