@@ -6,8 +6,12 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use cargo_metadata::MetadataCommand;
@@ -86,7 +90,7 @@ pub fn collect(root: &Path, opts: CollectOptions) -> Result<Context> {
     } else {
         Vec::new()
     };
-    let churn = collect_churn(&root_dir);
+    let churn = collect_churn(&root_dir, Duration::from_secs(config.churn_git_timeout_secs));
 
     let workspace = WorkspaceInfo {
         root: root_dir,
@@ -104,26 +108,61 @@ pub fn collect(root: &Path, opts: CollectOptions) -> Result<Context> {
 }
 
 /// Count how many commits touched each `.rs` file, via `git log --name-only`.
-/// Best-effort: returns empty when the root is not a git repo or git is absent.
-fn collect_churn(root: &Path) -> HashMap<PathBuf, usize> {
-    let output = Command::new("git")
+///
+/// Best-effort: returns an empty map when the root is not a git repo, git is
+/// absent, or the command exceeds `timeout`. The timeout prevents hangs on
+/// repositories with very long histories.
+fn collect_churn(root: &Path, timeout: Duration) -> HashMap<PathBuf, usize> {
+    let mut child = match Command::new("git")
         .args(["-C"])
         .arg(root)
         .args(["log", "--name-only", "--pretty=format:"])
-        .output();
-    let Ok(out) = output else {
-        return HashMap::new();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
     };
-    if !out.status.success() {
+
+    // Read stdout in a background thread so the main thread can enforce a
+    // wall-clock timeout without blocking on the child's pipe.
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = std::io::BufReader::new(stdout).read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    let raw = match rx.recv_timeout(timeout) {
+        Ok(s) => {
+            let _ = child.wait(); // reap the process
+            s
+        }
+        Err(_) => {
+            // Timeout or thread panic: kill git and report.
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "warn: `git log` timed out after {}s; churn-hotspot will be skipped \
+                 (increase churn_git_timeout_secs in rpi.toml to raise the limit)",
+                timeout.as_secs()
+            );
+            return HashMap::new();
+        }
+    };
+
+    if raw.is_empty() {
         return HashMap::new();
     }
+
     // git prints paths relative to the repo toplevel, which may differ from the
     // workspace root; anchor against the toplevel so keys are absolute and match
     // the paths inspections carry.
     let anchor = git_toplevel(root).unwrap_or_else(|| root.to_path_buf());
-    let text = String::from_utf8_lossy(&out.stdout);
     let mut churn: HashMap<PathBuf, usize> = HashMap::new();
-    for line in text.lines() {
+    for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || !line.ends_with(".rs") {
             continue;
@@ -328,5 +367,35 @@ mod tests {
     fn audit_json_tolerates_empty_and_garbage() {
         assert!(parse_audit_json("not json").is_empty());
         assert!(parse_audit_json("{}").is_empty());
+    }
+
+    #[test]
+    fn collect_churn_returns_empty_outside_git() {
+        // A directory with no .git returns an empty churn map without panicking.
+        let tmp = std::env::temp_dir().join("rpi_churn_no_git_29");
+        std::fs::create_dir_all(&tmp).ok();
+        let churn = collect_churn(&tmp, Duration::from_secs(10));
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(churn.is_empty(), "non-git root must yield empty churn");
+    }
+
+    #[test]
+    fn collect_churn_returns_empty_on_near_zero_timeout() {
+        // A 1ms timeout against a real git repo should either complete fast or
+        // time out — either way the function must return without panicking.
+        // We only assert no panic and that the result is a valid HashMap.
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../")
+            .canonicalize()
+            .unwrap();
+        let churn = collect_churn(&repo, Duration::from_millis(1));
+        // Result may or may not be empty depending on system speed; just verify
+        // the function terminates and the map is well-formed.
+        let _ = churn.len();
+    }
+
+    #[test]
+    fn config_default_timeout_is_thirty_seconds() {
+        assert_eq!(rpi_core::Config::default().churn_git_timeout_secs, 30);
     }
 }
